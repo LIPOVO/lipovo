@@ -1,0 +1,132 @@
+name: Build Ravisty iPhone app
+
+on:
+  push:
+    branches: [ravisty-remote-build]
+    paths:
+      - 'ravisty-remote/**'
+      - '.github/workflows/ravisty-ios.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ravisty-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    if: github.ref == 'refs/heads/ravisty-remote-build'
+    runs-on: macos-15
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+        working-directory: ravisty-remote
+    steps:
+      - name: Check out this revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Inspect Xcode and available simulators
+        id: simulator
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          export SIMULATOR_SDK_VERSION="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          xcrun simctl list runtimes --json > build/simulator-runtimes.json
+          xcrun simctl list devices available --json > build/simulator-devices.json
+          python3 <<'PY'
+          import json
+          import os
+
+          def version(value):
+              parts = [int(part) for part in value.split('.')]
+              return tuple((parts + [0, 0, 0])[:3])
+
+          sdk = version(os.environ['SIMULATOR_SDK_VERSION'])
+          with open('build/simulator-runtimes.json', encoding='utf-8') as handle:
+              runtimes = json.load(handle)['runtimes']
+          compatible = {
+              item['identifier']: version(item['version'])
+              for item in runtimes
+              if item.get('isAvailable', False)
+              and item['identifier'].startswith('com.apple.CoreSimulator.SimRuntime.iOS-')
+              and version(item['version']) <= sdk
+          }
+          with open('build/simulator-devices.json', encoding='utf-8') as handle:
+              devices = json.load(handle)['devices']
+          candidates = [
+              (compatible[runtime], device.get('state') == 'Booted', device['name'], device['udid'])
+              for runtime, entries in devices.items() if runtime in compatible
+              for device in entries
+              if device.get('isAvailable', False) and device['name'].startswith('iPhone')
+          ]
+          if not candidates:
+              raise SystemExit('No available iPhone simulator matches the selected Xcode SDK.')
+          runtime, booted, name, udid = max(candidates)
+          print(f'Selected {name}, iOS {".".join(map(str, runtime))}, {udid}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as handle:
+              handle.write(f'udid={udid}\n')
+              handle.write(f'booted={str(booted).lower()}\n')
+              handle.write(f'destination=platform=iOS Simulator,id={udid}\n')
+          PY
+
+      - name: Boot selected simulator
+        timeout-minutes: 5
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+          SIMULATOR_BOOTED: ${{ steps.simulator.outputs.booted }}
+        run: |
+          set -euo pipefail
+          if [[ "$SIMULATOR_BOOTED" != true ]]; then
+            xcrun simctl boot "$SIMULATOR_UDID"
+          fi
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+
+      - name: Run XCTest on simulator
+        timeout-minutes: 12
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        run: |
+          set -euo pipefail
+          xcodebuild -project RavistyRemote.xcodeproj -scheme RavistyRemote \
+            -configuration Debug -destination "$TEST_DESTINATION" \
+            -derivedDataPath build/TestDerivedData \
+            -resultBundlePath build/TestResults.xcresult \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO test 2>&1 | tee build/test.log
+
+      - name: Build unsigned IPA for AltStore
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          bash ./build-unsigned-ipa.sh 2>&1 | tee build/build.log
+          test -s build/RavistyRemote-unsigned.ipa
+          unzip -tq build/RavistyRemote-unsigned.ipa
+          file build/DerivedData/Build/Products/Release-iphoneos/RavistyRemote.app/RavistyRemote
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: RavistyRemote-unsigned
+          path: ravisty-remote/build/RavistyRemote-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: RavistyRemote-build-diagnostics
+          path: |
+            ravisty-remote/build/*.log
+            ravisty-remote/build/simulator-*.json
+            ravisty-remote/build/TestResults.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
