@@ -93,6 +93,18 @@ final class ADBProtocolTests: XCTestCase {
         XCTAssertNil(queue.next(now: 1.1))
     }
 
+    func testAppLaunchRejectsShellSyntaxInPackage() {
+        for invalid in ["ru.kinopoisk.tv; reboot", "$(id)", "ru.tv/name", "ru..tv", "ru.tv\nreboot", "ru.tv\n", "'quoted'", "1ru.tv"] {
+            XCTAssertThrowsError(try AppLaunchCommand.make(packageName: invalid))
+        }
+    }
+
+    func testAppLaunchAcceptsFixedShortcutPackages() throws {
+        for app in RemoteApp.favorites {
+            XCTAssertNoThrow(try AppLaunchCommand.make(packageName: app.package))
+        }
+    }
+
     func testFastInputAcceptsTransportAckBeforeHelperReply() async throws {
         try await checkFastInput(replyBeforeAck: false)
     }

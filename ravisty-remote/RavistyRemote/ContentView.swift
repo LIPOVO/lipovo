@@ -9,6 +9,7 @@ extension Color {
 struct ContentView: View {
     @StateObject private var remote = RemoteViewModel()
     @State private var showConnection = false
+    @State private var showHelp = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -23,6 +24,11 @@ struct ContentView: View {
                     navigationKeys
                     volume
                     favorites
+                    Button { showHelp = true } label: {
+                        Label("Музыка и трансляция экрана", systemImage: "questionmark.circle")
+                            .font(.system(size: 12)).foregroundStyle(.white.opacity(0.55))
+                    }
+                    .buttonStyle(RemotePressStyle())
                     Button(action: remote.takeScreenshot) {
                         Label("Посмотреть экран ТВ", systemImage: "rectangle.inset.filled.and.person.filled")
                             .font(.system(size: 15, weight: .medium))
@@ -49,6 +55,7 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showConnection) { connectionSheet }
         .sheet(isPresented: $remote.showScreenshot) { screenshotSheet }
+        .sheet(isPresented: $showHelp) { helpSheet }
         .onChange(of: scenePhase) { phase in
             if phase == .background { remote.enterBackground() }
             else if phase == .active { remote.enterForeground() }
@@ -223,6 +230,28 @@ struct ContentView: View {
                 ToolbarItem(placement: .confirmationAction) { Button("Готово") { remote.showScreenshot = false } }
             }
         }.tint(.ravistyRed).preferredColorScheme(.dark)
+    }
+
+    private var helpSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Повтор экрана iPhone") {
+                    Text("Откройте «AirPlay / Cast» на телевизоре. На iPhone откройте Пункт управления → Повтор экрана и выберите телевизор. Оба устройства должны быть в одной сети Wi-Fi.")
+                }
+                Section("Google Cast") {
+                    Text("Откройте «AirPlay / Cast» на телевизоре, затем нажмите значок трансляции в приложении с поддержкой Google Cast и выберите телевизор.")
+                }
+                Section("Яндекс Музыка") {
+                    Text("Откройте Кинопоиск на телевизоре и выберите «Музыка» в левом меню.")
+                }
+            }
+            .navigationTitle("Музыка и экран")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Готово") { showHelp = false } }
+            }
+        }
+        .tint(.ravistyRed).preferredColorScheme(.dark)
     }
 }
 

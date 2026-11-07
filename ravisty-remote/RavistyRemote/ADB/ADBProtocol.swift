@@ -1,12 +1,13 @@
 import Foundation
 
 enum ADBError: LocalizedError {
-    case invalidAddress, notConnected, busy, timeout, disconnected, protocolViolation(String)
+    case invalidAddress, invalidPackage, notConnected, busy, timeout, disconnected, protocolViolation(String)
     case authentication(String), rejectedService, outputTooLarge, missingPNG, key(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidAddress: return "Введите IPv4-адрес телевизора и порт от 1 до 65535."
+        case .invalidPackage: return "Некорректный идентификатор приложения."
         case .notConnected: return "Сначала подключитесь к телевизору."
         case .busy: return "Предыдущая команда ещё выполняется."
         case .timeout: return "Телевизор не ответил вовремя. Проверьте сеть и разрешение отладки на его экране."
@@ -136,4 +137,28 @@ struct RemoteKeyBuffer {
     }
 
     mutating func removeAll() { keys.removeAll(keepingCapacity: true) }
+}
+
+enum AppLaunchCommand {
+    /// Resolve non-default TV activities too, then launch an explicit, validated component.
+    /// Package values come from the app's fixed shortcuts; validation also prevents shell syntax.
+    static func make(packageName: String) throws -> String {
+        guard packageName.range(of: #"\A[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+\z"#,
+                                options: .regularExpression) != nil else {
+            throw ADBError.invalidPackage
+        }
+        return #"""
+        pkg='\#(packageName)'
+        for category in android.intent.category.LEANBACK_LAUNCHER android.intent.category.LAUNCHER; do
+          component="$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c "$category" -p "$pkg" 2>/dev/null | tail -n 1 | tr -d '\r')"
+          if printf '%s\n' "$component" | LC_ALL=C grep -Eq '^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+/(\.?[A-Za-z_$][A-Za-z0-9_.$]*)$'; then
+            case "$component" in
+              "$pkg"/*) am start -a android.intent.action.MAIN -n "$component"; exit $? ;;
+            esac
+          fi
+        done
+        printf '%s\n' 'Error: launchable activity not found'
+        exit 1
+        """#
+    }
 }

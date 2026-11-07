@@ -200,8 +200,11 @@ final class RemoteViewModel: ObservableObject {
     }
 
     func launch(_ app: RemoteApp) {
-        run(label: app.name,
-            command: "am start -a android.intent.action.MAIN -c android.intent.category.LEANBACK_LAUNCHER -p \(app.package)")
+        do {
+            run(label: app.name, command: try AppLaunchCommand.make(packageName: app.package))
+        } catch {
+            status = error.localizedDescription
+        }
     }
 
     private func run(label: String, command: String) {
@@ -271,6 +274,7 @@ struct RemoteApp: Identifiable {
         .init(name: "YouTube", package: "com.google.android.youtube.tv", symbol: "play.rectangle.fill", tint: Color(red: 0.95, green: 0.23, blue: 0.28)),
         .init(name: "Кинопоиск", package: "ru.kinopoisk.tv", symbol: "film.fill", tint: .orange),
         .init(name: "VK Видео", package: "com.vk.tv", symbol: "play.tv.fill", tint: .blue),
-        .init(name: "Wink", package: "ru.rt.video.app.tv", symbol: "tv.fill", tint: Color(red: 1, green: 0.34, blue: 0.22))
+        .init(name: "Wink", package: "ru.rt.video.app.tv", symbol: "tv.fill", tint: Color(red: 1, green: 0.34, blue: 0.22)),
+        .init(name: "AirPlay / Cast", package: "com.ionitech.airscreen", symbol: "airplayvideo", tint: .teal)
     ]
 }
