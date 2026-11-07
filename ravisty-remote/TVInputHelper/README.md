@@ -12,6 +12,7 @@ Place it on the TV once using an already authorized computer:
 
 ```sh
 adb -s 192.168.0.121:5555 push ravisty-input.jar /data/local/tmp/ravisty-input.jar
+adb -s 192.168.0.121:5555 shell chmod 600 /data/local/tmp/ravisty-input.jar
 ```
 
 The iPhone app opens this raw ADB service after connecting:
