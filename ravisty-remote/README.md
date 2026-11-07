@@ -15,7 +15,9 @@
 
 Исходники подготовлены на Windows, затем проверены [на macOS в GitHub Actions](https://github.com/LIPOVO/lipovo/actions/runs/42351972407): Xcode 16.4, iOS 18.5, симулятор iPhone SE 3-го поколения. **Все 6 XCTest прошли, Release-сборка arm64 и проверка IPA завершились успешно.** Проверенная ревизия: `b56fe81c044d45c36ee0e3eef8b20b18690cec73`.
 
-Скачанный файл: `build-artifact/RavistyRemote-unsigned.ipa`, 217400 байт. SHA-256: `7d94e95ec4af1b3a6eb82005d5050d7042e6ff9b154f721e9dea9087ef3df4d7`. В IPA проверены структура Payload и 64-битный исполняемый файл arm64. Это неподписанная сборка для последующей подписи AltStore. **Установка и сопряжение на реальном iPhone ещё не проверены.**
+Проверенная CI-сборка 1.0: `build-artifact/RavistyRemote-unsigned.ipa`, 217400 байт. SHA-256: `7d94e95ec4af1b3a6eb82005d5050d7042e6ff9b154f721e9dea9087ef3df4d7`. В IPA проверены структура Payload и 64-битный исполняемый файл arm64. Это неподписанная сборка для последующей подписи AltStore. **Установка и сопряжение на реальном iPhone ещё не проверены.**
+
+Версия 1.0.1 (build 2) использует ASCII-имена `CFBundleDisplayName = Ravisty Remote` и `CFBundleName = RavistyRemote` для совместимости с обработкой имени в AltStore после сообщения `The name "" contains invalid characters`. Исправлены только метаданные приложения; исполняемый файл не изменён. Успешная установка исправленной IPA на физический iPhone пока не подтверждена.
 
 Отдельная read-only проверка протокола на данном BQ подтвердила CNXN с объявлением версии 1.0, корректные контрольные суммы и два последовательных запроса `getprop ro.product.model` в одном TCP-соединении. Сервер прислал повторный CLSE для предыдущего stream ID; клиент учитывает такие поздние пакеты. Это проверка формата обмена, а не запуск Swift-приложения.
 
@@ -59,4 +61,3 @@ Legacy ADB не шифрует транспорт; используйте дов
 - [Apple SecKeyCreateSignature](https://developer.apple.com/documentation/security/seckeycreatesignature(_:_:_:_:))
 
 Код написан для этого проекта; алгоритм кодирования реализован по формату AOSP, без сторонней криптобиблиотеки. Приватный ключ не экспортируется из Keychain приложением.
-
