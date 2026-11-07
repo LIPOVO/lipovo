@@ -1,4 +1,5 @@
 import XCTest
+import Network
 @testable import RavistyRemote
 
 final class ADBProtocolTests: XCTestCase {
@@ -66,5 +67,192 @@ final class ADBProtocolTests: XCTestCase {
         XCTAssertEqual(key.uint32LE(at: 268), 0xb11f5508)
         XCTAssertEqual(key.uint32LE(at: 264 + 31 * 4), 0xe5380bcb)
         XCTAssertEqual(key.uint32LE(at: 264 + 63 * 4), 0x990257c7)
+    }
+
+    func testRemoteQueueKeepsOnlyThreeRecentKeys() {
+        var queue = RemoteKeyBuffer(capacity: 3, lifetime: 0.350)
+        for code in 1...5 { queue.append(code: code, label: "key", now: 10) }
+        XCTAssertEqual(queue.next(now: 10.1)?.code, 3)
+        XCTAssertEqual(queue.next(now: 10.1)?.code, 4)
+        XCTAssertEqual(queue.next(now: 10.1)?.code, 5)
+        XCTAssertNil(queue.next(now: 10.1))
+    }
+
+    func testRemoteQueueDropsExpiredTapsBeforeExecution() {
+        var queue = RemoteKeyBuffer(capacity: 3, lifetime: 0.350)
+        queue.append(code: 19, label: "old", now: 20)
+        queue.append(code: 20, label: "new", now: 20.3)
+        XCTAssertEqual(queue.next(now: 20.4)?.code, 20)
+        XCTAssertNil(queue.next(now: 20.7))
+    }
+
+    func testRemoteQueueCanBeClearedOnDisconnect() {
+        var queue = RemoteKeyBuffer()
+        queue.append(code: 23, label: "OK", now: 1)
+        queue.removeAll()
+        XCTAssertNil(queue.next(now: 1.1))
+    }
+
+    func testFastInputAcceptsTransportAckBeforeHelperReply() async throws {
+        try await checkFastInput(replyBeforeAck: false)
+    }
+
+    func testFastInputAcceptsHelperReplyBeforeTransportAck() async throws {
+        try await checkFastInput(replyBeforeAck: true)
+    }
+
+    func testFastInputDoesNotReplayKeyAfterClosedStream() async throws {
+        let peer = try LoopbackADBPeer()
+        let port = try await peer.start()
+        let server = Task { try await peer.serve(replyBeforeAck: false, closeFirstKey: true) }
+        let client = ADBClient()
+        defer { peer.stop() }
+        do {
+            _ = try await client.connect(host: "127.0.0.1", port: port) { _ in }
+            try await client.startInputSession()
+            do {
+                try await client.keyEvent(19)
+                XCTFail("Closed helper stream must fail the key operation")
+            } catch { /* Expected. The failed key must not be retried. */ }
+            let commands = try await server.value
+            XCTAssertEqual(commands, ["key 1 19\n"])
+            await client.disconnect()
+        } catch {
+            await client.disconnect()
+            peer.stop()
+            _ = try? await server.value
+            throw error
+        }
+    }
+
+    private func checkFastInput(replyBeforeAck: Bool) async throws {
+        let peer = try LoopbackADBPeer()
+        let port = try await peer.start()
+        let server = Task { try await peer.serve(replyBeforeAck: replyBeforeAck) }
+        let client = ADBClient()
+        defer { peer.stop() }
+        do {
+            _ = try await client.connect(host: "127.0.0.1", port: port) { _ in }
+            try await client.startInputSession()
+            try await client.keyEvent(19)
+            try await client.keyEvent(23)
+            let commands = try await server.value
+            XCTAssertEqual(commands, ["key 1 19\n", "key 2 23\n"])
+            await client.disconnect()
+        } catch {
+            await client.disconnect()
+            peer.stop()
+            _ = try? await server.value
+            throw error
+        }
+    }
+}
+
+/// Deterministic local peer exercises the actual client, including partial TCP reads.
+private final class LoopbackADBPeer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "ravisty.tests.adb-peer")
+    private let accepted: AsyncStream<NWConnection>
+    private let acceptContinuation: AsyncStream<NWConnection>.Continuation
+    private let lock = NSLock()
+    private var readyContinuation: CheckedContinuation<UInt16, Error>?
+    private var connections: [NWConnection] = []
+
+    init() throws {
+        var continuation: AsyncStream<NWConnection>.Continuation!
+        accepted = AsyncStream { continuation = $0 }
+        acceptContinuation = continuation
+        listener = try NWListener(using: .tcp, on: .any)
+    }
+
+    func start() async throws -> UInt16 {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock(); readyContinuation = continuation; lock.unlock()
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self else { connection.cancel(); return }
+                self.lock.lock(); self.connections.append(connection); self.lock.unlock()
+                self.acceptContinuation.yield(connection)
+            }
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    if let port = self.listener.port { self.finishReady(.success(port.rawValue)) }
+                    else { self.finishReady(.failure(ADBError.invalidAddress)) }
+                case .failed(let error): self.finishReady(.failure(error))
+                case .cancelled: self.finishReady(.failure(ADBError.disconnected))
+                default: break
+                }
+            }
+            queue.asyncAfter(deadline: .now() + 5) { [weak self] in self?.finishReady(.failure(ADBError.timeout)) }
+            listener.start(queue: queue)
+        }
+    }
+
+    private func finishReady(_ result: Result<UInt16, Error>) {
+        lock.lock(); let saved = readyContinuation; readyContinuation = nil; lock.unlock()
+        saved?.resume(with: result)
+    }
+
+    func stop() {
+        listener.cancel()
+        acceptContinuation.finish()
+        lock.lock(); let active = connections; connections.removeAll(); lock.unlock()
+        active.forEach { $0.cancel() }
+    }
+
+    func serve(replyBeforeAck: Bool, closeFirstKey: Bool = false) async throws -> [String] {
+        var iterator = accepted.makeAsyncIterator()
+        guard let connection = await iterator.next() else { throw ADBError.disconnected }
+        let tcp = ADBTCPStream(acceptedConnection: connection)
+        try await tcp.connect(timeout: 5)
+        let connect = try await read(tcp)
+        XCTAssertEqual(connect.command, ADBCommand.connect)
+        try await sendFragmented(tcp, ADBPacket(command: ADBCommand.connect, arg0: 0x01000000,
+                                              arg1: 4096, payload: Data("device::loopback\0".utf8)))
+        let open = try await read(tcp)
+        XCTAssertEqual(open.command, ADBCommand.open)
+        XCTAssertTrue(String(decoding: open.payload, as: UTF8.self).contains("ravisty-input.jar"))
+        let remote: UInt32 = 71
+        try await tcp.send(ADBPacket(command: ADBCommand.okay, arg0: remote, arg1: open.arg0).encoded())
+        // READY spans two ADB packets, with vendor text before it.
+        for text in ["vendor diagnostic\nREA", "DY 1\n"] {
+            try await sendFragmented(tcp, ADBPacket(command: ADBCommand.write, arg0: remote,
+                                                  arg1: open.arg0, payload: Data(text.utf8)))
+            let ack = try await read(tcp)
+            XCTAssertEqual(ack.command, ADBCommand.okay)
+        }
+        var commands: [String] = []
+        for sequence in 1...(closeFirstKey ? 1 : 2) {
+            let command = try await read(tcp)
+            XCTAssertEqual(command.command, ADBCommand.write)
+            commands.append(String(decoding: command.payload, as: UTF8.self))
+            if closeFirstKey {
+                try await tcp.send(ADBPacket(command: ADBCommand.close, arg0: remote, arg1: open.arg0).encoded())
+                return commands
+            }
+            let transportAck = ADBPacket(command: ADBCommand.okay, arg0: remote, arg1: open.arg0)
+            let reply = ADBPacket(command: ADBCommand.write, arg0: remote, arg1: open.arg0,
+                                  payload: Data("OK \(sequence)\n".utf8))
+            if !replyBeforeAck { try await tcp.send(transportAck.encoded()) }
+            try await sendFragmented(tcp, reply)
+            let replyAck = try await read(tcp)
+            XCTAssertEqual(replyAck.command, ADBCommand.okay)
+            if replyBeforeAck { try await tcp.send(transportAck.encoded()) }
+        }
+        return commands
+    }
+
+    private func read(_ tcp: ADBTCPStream) async throws -> ADBPacket {
+        let header = try await tcp.readExactly(24, timeout: 5)
+        let body = try await tcp.readExactly(ADBPacket.payloadLength(header: header), timeout: 5)
+        return try ADBPacket.decode(header: header, payload: body)
+    }
+
+    private func sendFragmented(_ tcp: ADBTCPStream, _ packet: ADBPacket) async throws {
+        let bytes = packet.encoded()
+        try await tcp.send(Data(bytes.prefix(7)))
+        try await tcp.send(Data(bytes.dropFirst(7).prefix(13)))
+        try await tcp.send(Data(bytes.dropFirst(20)))
     }
 }

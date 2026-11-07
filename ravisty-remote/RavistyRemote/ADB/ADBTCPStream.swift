@@ -4,12 +4,20 @@ import Network
 /// One reader and one writer, owned by ADBClient. NWConnection performs no TLS for legacy ADB.
 final class ADBTCPStream: @unchecked Sendable {
     private let connection: NWConnection
-    private let queue = DispatchQueue(label: "tv.ravisty.remote.adb.tcp")
+    private let queue = DispatchQueue(label: "tv.ravisty.remote.adb.tcp", qos: .userInitiated)
 
     init(host: String, port: UInt16) throws {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { throw ADBError.invalidAddress }
-        connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+        let tcp = NWProtocolTCP.Options()
+        // Remote buttons and ADB acknowledgements are tiny latency-sensitive packets.
+        // Do not wait for Nagle coalescing while the peer waits for an ACK.
+        tcp.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcp)
+        connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: parameters)
     }
+
+    /// Also permits an accepted loopback connection in the wire-protocol tests.
+    init(acceptedConnection: NWConnection) { connection = acceptedConnection }
 
     func connect(timeout: TimeInterval = 10) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in

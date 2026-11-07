@@ -9,6 +9,7 @@ extension Color {
 struct ContentView: View {
     @StateObject private var remote = RemoteViewModel()
     @State private var showConnection = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -34,6 +35,10 @@ struct ContentView: View {
                         .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
                         .multilineTextAlignment(.center).frame(maxWidth: .infinity)
                         .accessibilityIdentifier("connectionStatus")
+                    if let latency = remote.lastInputLatencyMS {
+                        Text("Отклик: \(latency) мс").font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.3))
+                    }
                 }
                 .padding(.horizontal, 25).padding(.top, 26).padding(.bottom, 30)
                 .frame(maxWidth: 510)
@@ -44,6 +49,10 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showConnection) { connectionSheet }
         .sheet(isPresented: $remote.showScreenshot) { screenshotSheet }
+        .onChange(of: scenePhase) { phase in
+            if phase == .background { remote.enterBackground() }
+            else if phase == .active { remote.enterForeground() }
+        }
     }
 
     private var header: some View {
@@ -98,7 +107,7 @@ struct ContentView: View {
             }
         }
         .frame(width: 260, height: 260)
-        .disabled(!remote.connected || remote.busy)
+        .disabled(!remote.connected)
         .opacity(remote.connected ? 1 : 0.55)
     }
 
@@ -116,7 +125,7 @@ struct ContentView: View {
             pill("house.fill", label: "Домой") { remote.key(3, label: "Домой") }
             pill("speaker.slash.fill", label: "Без звука") { remote.key(164, label: "Переключение звука") }
         }
-        .disabled(!remote.connected || remote.busy)
+        .disabled(!remote.connected)
     }
 
     private func pill(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
@@ -146,7 +155,7 @@ struct ContentView: View {
             }.accessibilityLabel("Увеличить громкость")
         }
         .background(Color.remoteCard, in: Capsule()).buttonStyle(RemotePressStyle())
-        .disabled(!remote.connected || remote.busy)
+        .disabled(!remote.connected)
     }
 
     private var favorites: some View {

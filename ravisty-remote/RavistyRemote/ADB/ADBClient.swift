@@ -6,6 +6,15 @@ actor ADBClient {
     private var connected = false
     private var busy = false
     private var nextLocalID: UInt32 = 1
+    private var inputSession: InputSession?
+    private var nextInputSequence: UInt32 = 1
+
+    private struct InputSession {
+        let local: UInt32
+        var remote: UInt32 = 0
+        var writeReady = true
+        var buffer = Data()
+    }
 
     func connect(host: String, port: UInt16, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard !busy else { throw ADBError.busy }
@@ -13,6 +22,7 @@ actor ADBClient {
         defer { busy = false }
         stream?.cancel()
         connected = false
+        inputSession = nil
         let tcp = try ADBTCPStream(host: host, port: port)
         stream = tcp
         do {
@@ -32,6 +42,7 @@ actor ADBClient {
                     }
                     connected = true
                     nextLocalID = 1
+                    nextInputSequence = 1
                     return String(decoding: packet.payload, as: UTF8.self).trimmingCharacters(in: .controlCharacters)
                 case ADBCommand.auth:
                     guard packet.arg0 == 1, authAttempt < 4 else {
@@ -62,6 +73,109 @@ actor ADBClient {
         stream?.cancel()
         stream = nil
         connected = false
+        inputSession = nil
+    }
+
+    /// Starts one JVM for the whole remote session, rather than starting `input` for each tap.
+    /// Use a separate ADBClient instance for one-off shell commands and screenshots.
+    func startInputSession() async throws {
+        guard connected, let tcp = stream else { throw ADBError.notConnected }
+        guard !busy, inputSession == nil else { throw ADBError.busy }
+        busy = true
+        defer { busy = false }
+        var session = InputSession(local: allocateLocalID())
+        let service = "exec:CLASSPATH=/data/local/tmp/ravisty-input.jar app_process /system/bin tv.ravisty.input.Main"
+        do {
+            try await tcp.send(ADBPacket(command: ADBCommand.open, arg0: session.local,
+                                        payload: Data((service + "\0").utf8)).encoded())
+            let deadline = Date().addingTimeInterval(8)
+            while true {
+                while let line = popInputLine(&session) {
+                    if line == "READY 1" { inputSession = session; return }
+                    if line.hasPrefix("ERR") { throw ADBError.protocolViolation(line) }
+                }
+                try await readInputPacket(tcp, session: &session, deadline: deadline)
+            }
+        } catch {
+            tcp.cancel()
+            stream = nil
+            connected = false
+            inputSession = nil
+            throw error
+        }
+    }
+
+    func keyEvent(_ code: Int) async throws {
+        guard connected, let tcp = stream, var session = inputSession else { throw ADBError.notConnected }
+        guard !busy else { throw ADBError.busy }
+        guard (0...400).contains(code) else { throw ADBError.protocolViolation("неверный код клавиши") }
+        busy = true
+        defer { busy = false }
+        let sequence = nextInputSequence
+        nextInputSequence = nextInputSequence == UInt32.max ? 1 : nextInputSequence + 1
+        do {
+            guard session.writeReady else { throw ADBError.protocolViolation("предыдущая команда не подтверждена") }
+            session.writeReady = false
+            try await tcp.send(ADBPacket(command: ADBCommand.write, arg0: session.local, arg1: session.remote,
+                                        payload: Data("key \(sequence) \(code)\n".utf8)).encoded(), timeout: 3)
+            var acknowledged = false
+            let deadline = Date().addingTimeInterval(3)
+            while true {
+                while let line = popInputLine(&session) {
+                    if line == "OK \(sequence)" { acknowledged = true }
+                    else if line.hasPrefix("ERR") { throw ADBError.protocolViolation(line) }
+                }
+                if acknowledged && session.writeReady { inputSession = session; return }
+                try await readInputPacket(tcp, session: &session, deadline: deadline)
+            }
+        } catch {
+            tcp.cancel()
+            stream = nil
+            connected = false
+            inputSession = nil
+            throw error
+        }
+    }
+
+    private func readInputPacket(_ tcp: ADBTCPStream, session: inout InputSession, deadline: Date) async throws {
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw ADBError.timeout }
+        let packet = try await readPacket(tcp, timeout: remaining)
+        guard packet.arg1 == session.local else {
+            if [ADBCommand.close, ADBCommand.okay, ADBCommand.write].contains(packet.command) { return }
+            throw ADBError.protocolViolation("пакет вне потока пульта")
+        }
+        switch packet.command {
+        case ADBCommand.okay:
+            guard packet.arg0 != 0, session.remote == 0 || session.remote == packet.arg0 else {
+                throw ADBError.protocolViolation("идентификатор потока пульта")
+            }
+            session.remote = packet.arg0
+            session.writeReady = true
+        case ADBCommand.write:
+            guard session.remote != 0, packet.arg0 == session.remote else {
+                throw ADBError.protocolViolation("WRITE пульта до OKAY")
+            }
+            guard packet.payload.count <= 8192 - session.buffer.count else { throw ADBError.outputTooLarge }
+            session.buffer.append(packet.payload)
+            try await tcp.send(ADBPacket(command: ADBCommand.okay, arg0: session.local, arg1: session.remote).encoded())
+        case ADBCommand.close: throw ADBError.rejectedService
+        default: throw ADBError.protocolViolation("неожиданная команда потока пульта")
+        }
+    }
+
+    private func popInputLine(_ session: inout InputSession) -> String? {
+        guard let end = session.buffer.firstIndex(of: 10) else { return nil }
+        let line = String(decoding: session.buffer[..<end], as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        session.buffer.removeSubrange(...end)
+        return line
+    }
+
+    private func allocateLocalID() -> UInt32 {
+        let result = nextLocalID
+        nextLocalID = nextLocalID == UInt32.max ? 1 : nextLocalID + 1
+        return result
     }
 
     func shell(_ command: String) async throws -> String {
@@ -77,11 +191,10 @@ actor ADBClient {
 
     private func execute(service: String, limit: Int, timeout: TimeInterval) async throws -> Data {
         guard connected, let tcp = stream else { throw ADBError.notConnected }
-        guard !busy else { throw ADBError.busy }
+        guard !busy, inputSession == nil else { throw ADBError.busy }
         busy = true
         defer { busy = false }
-        let local = nextLocalID
-        nextLocalID = nextLocalID == UInt32.max ? 1 : nextLocalID + 1
+        let local = allocateLocalID()
         let deadline = Date().addingTimeInterval(timeout)
         do {
             try await tcp.send(ADBPacket(command: ADBCommand.open, arg0: local,

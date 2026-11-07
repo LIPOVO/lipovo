@@ -107,3 +107,33 @@ enum PNGResponse {
         return png
     }
 }
+
+/// Small, expiring FIFO. A slow link must never replay seconds of old remote taps.
+struct RemoteKeyBuffer {
+    struct Key {
+        let code: Int
+        let label: String
+        let submittedAt: TimeInterval
+    }
+    let capacity: Int
+    let lifetime: TimeInterval
+    private var keys: [Key] = []
+
+    init(capacity: Int = 3, lifetime: TimeInterval = 0.350) {
+        self.capacity = max(1, capacity)
+        self.lifetime = max(0, lifetime)
+    }
+
+    mutating func append(code: Int, label: String, now: TimeInterval) {
+        keys.removeAll { now - $0.submittedAt > lifetime }
+        if keys.count >= capacity { keys.removeFirst(keys.count - capacity + 1) }
+        keys.append(Key(code: code, label: label, submittedAt: now))
+    }
+
+    mutating func next(now: TimeInterval) -> Key? {
+        keys.removeAll { now - $0.submittedAt > lifetime }
+        return keys.isEmpty ? nil : keys.removeFirst()
+    }
+
+    mutating func removeAll() { keys.removeAll(keepingCapacity: true) }
+}
